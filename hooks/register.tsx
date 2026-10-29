@@ -1,8 +1,9 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Account, BoardSize, BoardTheme, Game, PuzzleData, Stats, View } from '../types'
+import type { Account, BoardSize, BoardTheme, Game, Locale, Phrase, PuzzleData, Stats, View } from '../types'
 import { parseFen, sideOf, sqIndex, sqName } from './chess'
+import { LOCALES, PhraseError, asLocale, phrase, pickLocale, reason, say, stringsFor } from './i18n'
 import {
   awaitsReply, clickToUci, fromLichess, hint, isWin, newGame, pickOffline, play, reply, reveal,
 } from './puzzle'
@@ -67,6 +68,8 @@ const SQUARE: Record<BoardSize, { width: number; height: number }> = {
 }
 const paneRows = (size: BoardSize) => SQUARE[size].height * 8 + 9
 
+const USAGE = `next|login|logout|size small|medium|large|theme auto|dark|light|auto on|off|lang auto|${LOCALES.join('|')}`
+
 type $ = EngineInterface
 
 const settings = {
@@ -76,6 +79,7 @@ const settings = {
   autoClose: true,
   size: 'medium' as BoardSize,
   boardTheme: 'auto' as BoardTheme,
+  language: 'auto',
 }
 
 const asSize = (x: unknown): BoardSize | undefined => (SIZES.includes(x as BoardSize) ? (x as BoardSize) : undefined)
@@ -92,6 +96,22 @@ async function paletteFor($: $, chosen: BoardTheme): Promise<Palette> {
     return PALETTES.dark
   }
 }
+
+/** /chess lang, the setting, Claude Code's language setting, then the locale variables. */
+async function resolveLocale($: $): Promise<Locale> {
+  const language = await $.settings.read({ key: 'language' }).catch(() => undefined)
+  return pickLocale([
+    asLocale(await $.store.get('lang')),
+    settings.language,
+    typeof language === 'string' ? language : undefined,
+    await $.env.get('LC_ALL'),
+    await $.env.get('LC_MESSAGES'),
+    await $.env.get('LANG'),
+  ])
+}
+
+/** The strings in the person's language. */
+const tr = async ($: $) => stringsFor((await read($, view)).locale)
 
 async function setSize($: $, size: BoardSize) {
   await $.store.set('size', size)
@@ -124,15 +144,15 @@ async function loadPuzzle($: $) {
   await update($, view, v => ({ ...v, isLoading: true, notice: undefined }))
   const token = await getToken($)
   let puzzle: PuzzleData
-  let notice: string | undefined
+  let notice: Phrase | undefined
   try {
     const res = await lichess($, `/api/puzzle/next?angle=mix&difficulty=${settings.difficulty}`, { token })
-    if (res.status === 401 && token) throw new Error('token refusé, reconnecte-toi')
+    if (res.status === 401 && token) throw new PhraseError(phrase('tokenRefused'))
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     puzzle = fromLichess(JSON.parse(res.text))
   } catch (err) {
     puzzle = pickOffline(before.game?.puzzle.id)
-    notice = `Lichess injoignable (${err instanceof Error ? err.message : String(err)}) : puzzle hors-ligne.`
+    notice = phrase('offline', reason(err))
   }
   await update($, view, v => ({ ...v, isLoading: false, notice, game: newGame(puzzle) }))
 }
@@ -171,13 +191,13 @@ async function settle($: $, game: Game, win: boolean) {
     const account = await update($, view, v => ({
       ...v,
       account: v.account && rating ? { ...v.account, rating: Math.round(rating) } : v.account,
-      notice: typeof diff === 'number' ? `Classement puzzle ${diff >= 0 ? '+' : ''}${diff}` : v.notice,
+      notice: typeof diff === 'number' ? phrase('ratingDiff', `${diff >= 0 ? '+' : ''}${diff}`) : v.notice,
     }))
     if (account.account) await $.store.set('account', account.account)
   } catch (err) {
     await update($, view, v => ({
       ...v,
-      notice: `Résultat non envoyé à Lichess (${err instanceof Error ? err.message : String(err)}).`,
+      notice: phrase('notSent', reason(err)),
     }))
   }
 }
@@ -243,22 +263,22 @@ async function nextPuzzle($: $) {
 async function login($: $, raw: string) {
   const token = raw.trim()
   if (!token) return
-  await update($, view, v => ({ ...v, loginError: undefined, notice: 'Vérification du token…' }))
+  await update($, view, v => ({ ...v, loginError: undefined, notice: phrase('checkingToken') }))
   try {
     const res = await lichess($, '/api/account', { token })
-    if (res.status === 401) throw new Error('token invalide')
+    if (res.status === 401) throw new PhraseError(phrase('invalidToken'))
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const body = JSON.parse(res.text) as { username?: string; perfs?: { puzzle?: { rating?: number } } }
-    if (!body.username) throw new Error('réponse inattendue')
+    if (!body.username) throw new PhraseError(phrase('unexpectedAnswer'))
     const account: Account = { username: body.username, rating: body.perfs?.puzzle?.rating }
     await $.store.set('token', token)
     await $.store.set('account', account)
-    await update($, view, v => ({ ...v, account, isLoginOpen: false, notice: `Connecté en tant que ${account.username}.` }))
+    await update($, view, v => ({ ...v, account, isLoginOpen: false, notice: phrase('signedIn', account.username) }))
   } catch (err) {
     await update($, view, v => ({
       ...v,
       notice: undefined,
-      loginError: `Connexion impossible : ${err instanceof Error ? err.message : String(err)}`,
+      loginError: phrase('signInFailed', reason(err)),
     }))
   }
 }
@@ -271,7 +291,7 @@ async function logout($: $) {
   }
   await $.store.delete('token')
   await $.store.delete('account')
-  await update($, view, v => ({ ...v, account: undefined, notice: 'Déconnecté : mode anonyme.' }))
+  await update($, view, v => ({ ...v, account: undefined, notice: phrase('signedOut') }))
 }
 
 async function isAutoOpen($: $) {
@@ -293,61 +313,73 @@ export const register: Register = (on, options) => {
   settings.autoClose = options.autoClose !== false
   settings.size = asSize(options.size) ?? 'medium'
   settings.boardTheme = asTheme(options.boardTheme) ?? 'auto'
+  settings.language = String(options.language ?? 'auto')
 
   on('session.start', async ($, e, next) => {
+    const locale = await resolveLocale($)
     await $.command.register({
       name: 'chess',
-      description: "Puzzles d'échecs Lichess : ouvrir le panneau, next, login, logout, size, theme, auto",
-      argumentHint: '[next|login|logout|size small|medium|large|theme auto|dark|light|auto on|off]',
+      description: stringsFor(locale).commandDescription,
+      argumentHint: `[${USAGE}]`,
     })
     const account = (await $.store.get('account')) as Account | undefined
     const stats = (await $.store.get('stats')) as Stats | undefined
     const size = asSize(await $.store.get('size'))
     const boardTheme = asTheme(await $.store.get('boardTheme'))
-    await update($, view, v => ({ ...v, account: account ?? undefined, stats: stats ?? v.stats, size, boardTheme }))
+    await update($, view, v => ({ ...v, account: account ?? undefined, stats: stats ?? v.stats, size, boardTheme, locale }))
     return next(e)
   })
 
   on('command.run', { command: 'chess' }, async ($, e) => {
     const args = e.args.trim().split(/\s+/).filter(Boolean)
+    const t = await tr($)
     switch (args[0]?.toLowerCase()) {
       case undefined:
         await openPane($, true)
-        return { text: 'Panneau puzzle ouvert.' }
+        return { text: t.paneOpened }
       case 'next':
         await openPane($)
         await nextPuzzle($)
-        return { text: 'Nouveau puzzle.' }
+        return { text: t.newPuzzle }
       case 'login':
         if (args[1]) {
-          return { text: "Ne colle pas ton token dans une commande (il finirait dans la conversation) : utilise le champ du panneau." }
+          return { text: t.noTokenInCommand }
         }
         await update($, view, v => ({ ...v, isLoginOpen: true, loginError: undefined }))
         await openPane($, true)
-        return { text: 'Colle ton token Lichess dans le panneau puzzle.' }
+        return { text: t.pasteToken }
       case 'logout':
         await logout($)
-        return { text: 'Compte Lichess déconnecté, puzzles en mode anonyme.' }
+        return { text: t.loggedOut }
       case 'auto': {
         const isOn = args[1] !== 'off'
         await $.store.set('autoOpen', isOn)
-        return { text: isOn ? 'Le panneau s’ouvrira quand Claude travaille.' : 'Ouverture automatique désactivée.' }
+        return { text: isOn ? t.autoOn : t.autoOff }
       }
       case 'size': {
         const size = asSize(args[1])
-        if (!size) return { text: 'Usage : /chess size small|medium|large' }
+        if (!size) return { text: t.usage('size small|medium|large') }
         await setSize($, size)
-        return { text: `Plateau en taille ${size}.` }
+        return { text: t.sizeSet(size) }
       }
       case 'theme': {
         const boardTheme = asTheme(args[1])
-        if (!boardTheme) return { text: 'Usage : /chess theme auto|dark|light' }
+        if (!boardTheme) return { text: t.usage('theme auto|dark|light') }
         await $.store.set('boardTheme', boardTheme)
         await update($, view, v => ({ ...v, boardTheme }))
-        return { text: `Couleurs du plateau : ${boardTheme}.` }
+        return { text: t.themeSet(boardTheme) }
+      }
+      case 'lang': {
+        const lang = args[1]?.toLowerCase()
+        if (lang !== 'auto' && !asLocale(lang)) return { text: t.usage(`lang auto|${LOCALES.join('|')}`) }
+        if (lang === 'auto') await $.store.delete('lang')
+        else await $.store.set('lang', lang)
+        const locale = await resolveLocale($)
+        await update($, view, v => ({ ...v, locale }))
+        return { text: stringsFor(locale).langSet(locale) }
       }
       default:
-        return { text: 'Usage : /chess [next|login|logout|size small|medium|large|theme auto|dark|light|auto on|off]' }
+        return { text: t.usage(`[${USAGE}]`) }
     }
   })
 
@@ -365,7 +397,8 @@ export const register: Register = (on, options) => {
     const panes = await $.ui.panes()
     if (!panes.some(p => p.id === PANE)) return result
     if (isStarted(game)) {
-      $.ui.toast(settings.autoClose ? 'Claude a terminé ✓ Finis ton puzzle, le panneau se fermera ensuite.' : 'Claude a terminé ✓')
+      const t = await tr($)
+      $.ui.toast(settings.autoClose ? t.claudeDoneFinish : t.claudeDone)
     } else if (settings.autoClose) {
       await $.ui.close({ id: PANE })
     }
@@ -378,18 +411,19 @@ export const register: Register = (on, options) => {
     const Input = 'Input' in els ? els.Input : undefined
     const v = await read($, view)
     const g = v.game
+    const t = stringsFor(v.locale)
 
     const accountLine = (
       <Box flexDirection="row" gap={1}>
         <Text dimColor>
-          {v.account ? `👤 ${v.account.username}${v.account.rating ? ` (${v.account.rating})` : ''}` : 'Anonyme'}
-          {` · ${v.stats.solved}✓ ${v.stats.failed}✗ · série ${v.stats.streak}`}
+          {v.account ? `👤 ${v.account.username}${v.account.rating ? ` (${v.account.rating})` : ''}` : t.anonymous}
+          {` · ${v.stats.solved}✓ ${v.stats.failed}✗ · ${t.streak(v.stats.streak)}`}
         </Text>
         {v.account ? (
-          <Button key="logout" plain dimColor onPress={() => void logout($)}>déconnexion</Button>
+          <Button key="logout" plain dimColor onPress={() => void logout($)}>{t.logout}</Button>
         ) : (
           <Button key="login" plain dimColor onPress={() => void update($, view, x => ({ ...x, isLoginOpen: true, loginError: undefined }))}>
-            se connecter
+            {t.login}
           </Button>
         )}
         <Button key="size-down" plain dimColor onPress={() => void stepSize($, -1)}>−</Button>
@@ -400,21 +434,21 @@ export const register: Register = (on, options) => {
     if (v.isLoginOpen) {
       return (
         <Box flexDirection="column" gap={1}>
-          <Text bold>Connecter ton compte Lichess</Text>
-          <Text>1. Crée un token personnel (droits puzzle) :</Text>
-          <Link href={TOKEN_URL} label="lichess.org → créer un token" />
+          <Text bold>{t.connectTitle}</Text>
+          <Text>{t.connectStep1}</Text>
+          <Link href={TOKEN_URL} label={t.createToken} />
           {Input ? (
             <Box flexDirection="column">
-              <Text>2. Colle-le ici puis Entrée :</Text>
+              <Text>{t.connectStep2}</Text>
               <Input key="token" placeholder="lip_…" autoFocus onSubmit={value => void login($, value)} />
             </Box>
           ) : (
-            <Text dimColor>Ce client n’a pas de champ texte : connecte-toi depuis le terminal ou l’app desktop.</Text>
+            <Text dimColor>{t.noInput}</Text>
           )}
-          {v.loginError && <Text color="error">{v.loginError}</Text>}
-          {v.notice && <Text dimColor>{v.notice}</Text>}
-          <Text dimColor>Le token reste sur ta machine, jamais dans la conversation.</Text>
-          <Button key="cancel-login" onPress={() => void update($, view, x => ({ ...x, isLoginOpen: false }))}>Annuler</Button>
+          {v.loginError && <Text color="error">{say(t, v.loginError)}</Text>}
+          {v.notice && <Text dimColor>{say(t, v.notice)}</Text>}
+          <Text dimColor>{t.tokenStays}</Text>
+          <Button key="cancel-login" onPress={() => void update($, view, x => ({ ...x, isLoginOpen: false }))}>{t.cancel}</Button>
         </Box>
       )
     }
@@ -422,8 +456,8 @@ export const register: Register = (on, options) => {
     if (!g) {
       return (
         <Box flexDirection="column">
-          <Text dimColor>{v.isLoading ? 'Chargement du puzzle…' : 'Aucun puzzle chargé.'}</Text>
-          {!v.isLoading && <Button key="load" onPress={() => void loadPuzzle($)}>Charger un puzzle</Button>}
+          <Text dimColor>{v.isLoading ? t.loadingPuzzle : t.noPuzzle}</Text>
+          {!v.isLoading && <Button key="load" onPress={() => void loadPuzzle($)}>{t.loadPuzzle}</Button>}
           {accountLine}
         </Box>
       )
@@ -465,12 +499,12 @@ export const register: Register = (on, options) => {
       Array.from({ length: height }, (_, row) => (row === middle ? `${r + 1} ` : '  ')).join('\n')
     const fileLabels = '  ' + files.map(f => cellText('abcdefgh'.charAt(f)).split('\n')[middle]).join('')
     const puzzleUrl = g.puzzle.source === 'lichess' ? `${LICHESS}/training/${g.puzzle.id}` : undefined
-    const side = g.player === 'w' ? 'Blancs' : 'Noirs'
+    const side = t.side(g.player)
 
     return (
       <Box flexDirection="column">
         <Text dimColor>
-          {g.puzzle.source === 'lichess' ? `#${g.puzzle.id}` : 'hors-ligne'}
+          {g.puzzle.source === 'lichess' ? `#${g.puzzle.id}` : t.offlineTag}
           {g.puzzle.rating ? ` · ★${g.puzzle.rating}` : ''}
           {` · ${side}`}
           {g.puzzle.themes.length ? ` · ${g.puzzle.themes.slice(0, 2).join(', ')}` : ''}
@@ -483,21 +517,21 @@ export const register: Register = (on, options) => {
         ))}
         <Text dimColor>{fileLabels}</Text>
         {g.message && (
-          <Text color={g.status === 'solved' ? 'success' : g.message.startsWith('✗') ? 'error' : undefined}>{g.message}</Text>
+          <Text color={g.status === 'solved' ? 'success' : g.message.id === 'wrong' ? 'error' : undefined}>{say(t, g.message)}</Text>
         )}
-        {v.isLoading ? <Text dimColor>Chargement…</Text> : v.notice ? <Text dimColor>{v.notice}</Text> : null}
+        {v.isLoading ? <Text dimColor>{t.loading}</Text> : v.notice ? <Text dimColor>{say(t, v.notice)}</Text> : null}
         {Input && g.status === 'playing' && (
-          <Input key={`move-${g.puzzle.id}`} placeholder="Coup : e2e4 ou Cf3/Nf3" onSubmit={value => void changeGame($, x => play(x, value))} />
+          <Input key={`move-${g.puzzle.id}`} placeholder={t.movePlaceholder} onSubmit={value => void changeGame($, x => play(x, value))} />
         )}
         <Box flexDirection="row" gap={1}>
           {g.status === 'playing' && (
-            <Button key="hint" hotkey="h" onPress={() => void changeGame($, hint)}>Indice</Button>
+            <Button key="hint" hotkey="h" onPress={() => void changeGame($, hint)}>{t.hintButton}</Button>
           )}
           {g.status === 'playing' && (
-            <Button key="reveal" hotkey="s" onPress={() => void changeGame($, reveal)}>Solution</Button>
+            <Button key="reveal" hotkey="s" onPress={() => void changeGame($, reveal)}>{t.solutionButton}</Button>
           )}
           <Button key="next" hotkey="n" variant={g.status === 'playing' ? undefined : 'primary'} onPress={() => void nextPuzzle($)}>
-            Suivant
+            {t.next}
           </Button>
           {puzzleUrl && <Link href={puzzleUrl} label="Lichess ↗" />}
         </Box>
